@@ -1,0 +1,298 @@
+<?php
+// $Id$
+/**
+ * @file
+ *
+ * Contains tests for the core non-profit chapter module related to module
+ * startup.
+ */
+class ChapterSetupTestCase extends DrupalWebTestCase {
+  public static function getInfo() {
+    return array(
+      'name'         => 'Chapter Installation',
+      'description'  => 'Verify the core non-profit chapter install',
+      'group'        => 'A Non-Profit Chapter Module',
+      'dependencies' => array(
+        'field',
+        'field_ui',
+        'date_api',
+        'date',
+        'link',
+        'number',
+        'cck',
+        'options',
+        'taxonomy',
+        'token',
+        'references',
+        'node_reference',
+        'user_reference',
+      ),
+    );
+  }
+
+  /**
+   * Set up modules for our test cases
+   *
+   * The setup process calls this method to add in modules or other
+   * features that are not part of a base Drupal 7 core install.
+   */
+  protected function setUp() {
+    // Uncomment next to decrease how long our tests run.  It should
+    // be set before calling into the parent's setUp() method.  If debugging,
+    // you may want to set it > 600...
+
+    //$this->timeLimit = 120;
+
+    // Enable the 'chapter' module which is the target of this test
+
+    parent::setUp('chapter');
+  }
+
+  /**
+   * Did variables used by the chapter module exists
+   *
+   * Tests common variables the module uses.  The actual values do not really matter but
+   * the type (string, integer, ...) does.
+   */
+  function testChapterVariablesExist() {
+    // Test all our variables
+
+    foreach (_chapter_installed_variables() as $variable => $data) {
+      // See if it is already present.  If the value is NULL, we
+      // know that it has never been initialized
+      //
+      // Get the variable.  NULL is returned if it is not found
+
+      $value = variable_get($variable);
+      $this->assertNotNull($value, 'Variable ' . $variable . ' is NULL',
+      					   'install');
+
+      if ($value != NULL) {
+        // If it has a valid test function to check the return type, call
+        // it as well
+
+        if (!empty($data['test']) && is_callable($data['test'])) {
+          $result = call_user_func($data['test'], $value);
+
+          $this->assertTrue($result, 'Variable ' . $variable .
+                            ' failed the variable type test: ' . $data['test'],
+           					'install');
+        }
+        else {
+          $this->fail('Variable ' . $variable .
+                      ' does not have a test function or the one provided' .
+                      ' is not callable', 'install');
+        }
+      }
+    }
+  }
+
+  /**
+   * Did all field types get installed
+   *
+   * Tests that the field API allowed all of our fields to be installed
+   */
+  function testChapterFieldsExist() {
+    // Test all our fields
+
+    foreach (_chapter_installed_fields() as $field) {
+      // Only add it if we cannot find an existing entry
+
+      $existing_field = field_info_field($field['field_name']);
+
+      $this->assertTrue(is_array($existing_field) && count($existing_field) > 0,
+      					'Field ' . $field['field_name'] . ' does not exist',
+      					'install');
+    }
+  }
+
+  /**
+   * Did all content types get installed
+   *
+   * Tests that the core content types got installed
+   */
+  function testChapterContentTypesExist() {
+    // Test all our content types
+
+    foreach(_chapter_node_export_weights() as $node_type => $weight) {
+      // Test that it exists
+
+      $this->assertTrue(node_type_get_type($node_type),
+          'Node type ' . $node_type . ' does not exist', 'install');
+    }
+  }
+
+  /**
+   * Did all roles get installed
+   *
+   * Tests that the core content types got installed
+   */
+  function testChapterRolesExist() {
+    // Test for all our roles
+
+    $board_positions = _chapter_board_positions();
+
+    foreach($board_positions as $position => $attributes) {
+
+      // Test that it exists
+
+      $role_name = !empty($attributes['name']) ? $attributes['name']
+                                               : $position;
+
+      $this->assertTrue(user_role_load_by_name($role_name),
+                        'The role ' . $role_name . ' does not exist',
+      					'install');
+    }
+  }
+}
+
+/**
+ * Did vocabularies get installed
+ *
+ * Verify that the minimal vocabulary was successfully installed.
+ */
+function testChapterVocabularyExists() {
+  // Get the vocabularies
+
+  $this->verbose('Vocabulary tests');
+
+  $vocabularies = _chapter_get_vocabulary();
+
+  foreach($vocabularies as $vocabulary) {
+    // Validate VID parameter
+
+    $vid = variable_get($vocabulary['vid_variable']);
+    $this->assertNotNull($vid,
+                         'Vocabulary variable ' . $variable['vid_variable'] . ' is NULL',
+                         'install');
+    if ($vid != NULL) {
+      // Check out the vocabulary
+
+      $vocab = taxonomy_vocabulary_load($vid);
+
+      $this->assertNotNull($vocab, 'Vocabulary ' . $variable['name'] .
+                           ' does not exist', 'install');
+      $this->assertFalse(empty($vocab->name),
+                         'Vocabulary ' . $variable['name'] . ' name parameter missing',
+                         'install');
+      $this->assertFalse(empty($vocab->machine_name),
+                   'Vocabulary ' . $variable['name'] . ' machine name parameter missing',
+                   'install');
+      $this->assertFalse(empty($vocab->module),
+                   'Vocabulary ' . $variable['module'] . ' module parameter missing',
+                   'install');
+      $this->assertEqual($vocab->module, 'chapter',
+                   'Vocabulary ' . $variable['module'] . ' module parameter missing',
+                   'install');
+      $this->assertFalse(empty($vocab->description),
+                         'Vocabulary ' . $variable['name'] . ' description parameter missing',
+                         'install');
+
+      // Verify proper installation of any terms
+
+      foreach($vocabulary['terms'] as $term_data) {
+
+        // Get the term
+        // TODO: This form of lookup (conditions) is deprecated and will go away
+        //       in Drupal 8
+
+        $termList = entity_load('taxonomy_term', array(),
+                                array('name' => $term_data['name'], 'vid' => $vid));
+
+        $this->assertFalse(empty($termList),
+                           'Vocabulary ' . $variable['name'] . ' term ' .
+                           $term_data['name'] .' is not available',
+                           'install');
+
+        if (!empty($termList)) {
+
+          // Use only the first item of the array.  Should be a Term object
+
+          $this->assertTrue(count($termList) == 1,
+                             'Vocabulary ' . $variable['name'] . ' term ' .
+                             $term_data['name'] .' is not unique',
+                             'install');
+
+          $term = array_shift($termList);
+
+          $this->assertTrue(is_object($term),
+                             'Vocabulary ' . $variable['name'] . ' term ' .
+                             $term_data['name'] .' is not a term object',
+                             'install');
+
+          if (is_object($term)) {
+            $this->assertEqual($term->vocabulary_machine_name, $vocab->machine_name,
+                       'Vocabulary ' . $variable['name'] . ' vocabulary machine name ' .
+                       $term->vocabulary_machine_name .' does not match',
+                       'install');
+
+            $this->assertFalse(empty($term->$tid),
+                  'Vocabulary ' . $variable['name'] . ' term ' .
+                  $term_data['name'] .' does not have a valid TID',
+                  'install');
+
+            $this->assertFalse(empty($term->$vid),
+                  'Vocabulary ' . $variable['name'] . ' term ' .
+                  $term_data['name'] .' does not have a valid VID',
+                  'install');
+
+            $this->assertFalse(empty($term->$name),
+                  'Vocabulary ' . $variable['name'] . ' term ' .
+                  $term_data['name'] .' does not have a valid name',
+                  'install');
+
+            // Require all terms to have a description associated to them
+
+            $this->assertFalse(empty($term->$description),
+                  'Vocabulary ' . $variable['name'] . ' term ' .
+                  $term_data['name'] .' does not have a valid description',
+                  'install');
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Test default membership type
+ *
+ * This logic is used to define the default for the membership type field instance
+ */
+function testGetDefaultMembershipType() {
+
+  // Get the default membership type TID
+
+  $vid = variable_get('chapter_member_type_vocabulary', 0);
+
+  if ($vid > 0) {
+    // Get the term
+    //
+    // @todo This form of lookup (conditions) is deprecated and will go away
+    //       in Drupal 8
+
+    $termList = entity_load('taxonomy_term', array(),
+                            array('name' => 'Active', 'vid' => $vid));
+
+    $this->assertFalse(empty($termList),
+    			   'Unable to find default Membership Type Term Active',
+                   'install');
+
+    if (!empty($termList)) {
+
+      // Use only the first item of the array.  Should be a Term object
+
+      $term = array_shift($termList);
+
+      $this->assertTrue(is_object($term),
+            	'Default Membership Type Term is not an object',
+      			'install');
+
+      if (is_object($term)) {
+        $this->assertFalse(empty($term->tid),
+    			   'Unable to find default Membership Type Term Active Parameter',
+                   'install');
+      }
+    }
+  }
+}

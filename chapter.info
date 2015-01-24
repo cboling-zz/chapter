@@ -1,0 +1,31 @@
+; $Id$
+;
+; Before installing, you may want to update some of the 'define's at the top
+; of chapter.install.  They allow for a few customizations that you may wish
+; to change for your implementation.
+;
+;
+name           = Chapter Tools
+description    = Core non-profit chapter modules that provide basic member and chapter contact information.
+core           = 7.x
+package        = AAA Non-Profit Tools
+dependencies[] = date
+dependencies[] = link
+dependencies[] = number
+dependencies[] = taxonomy
+dependencies[] = token
+dependencies[] = node_reference
+dependencies[] = user_reference
+;dependencies[] = relations
+files[]        = chapter.install
+files[]        = chapter.module
+files[]        = chapter.admin.inc
+files[]        = includes/chapter.util.inc
+files[]        = includes/chapter.forms.inc
+files[]        = includes/chapter.contact.inc
+configure      = admin/config/chapter/settings
+;
+; Tests
+;
+files[]        = test/chapter.test
+files[]        = test/chapter.node.simple.test

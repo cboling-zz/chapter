@@ -1,0 +1,1597 @@
+<?php
+// $Id$
+/**
+ * @file
+ * Contains install and update functions for chapter tools.
+ *
+ * Default for unassigned board positions.
+ *
+ * If set to a default, the position and roll is not filled or displayed
+ * on most nodes and forms.  Typically you do not want to modify this value
+ */
+/**
+ * If the following is TRUE, then permissions for various board positions (above)
+ * will be created for this module's content types
+ */
+define('CHAPTER_ASSIGN_ROLES_ON_INSTALL', TRUE);
+
+/**
+ * Include the utility module
+ */
+include_once(DRUPAL_ROOT . '/' . drupal_get_path('module', 'chapter') . '/includes/chapter.util.inc');
+
+/**
+ * Implements hook_install()
+ *
+ * This function is responsible for installing the core for the chapter
+ * tools.
+ *
+ * If the module implements hook_schema(), the database tables will be
+ * created before this hook is fired.  This hook will only be called the
+ * first time a module is enabled or after it is re-enabled after being
+ * uninstalled.
+ */
+function chapter_install() {
+  // Use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t = get_t();
+
+  // Initialize any variables that we use
+
+  foreach (_chapter_installed_variables() as $variable => $data) {
+    // See if it is already present.  If the value is NULL, we
+    // know that it has never been initialized
+
+    $tmp_value = variable_get($variable);
+
+    if ($tmp_value == NULL) {
+      variable_set($variable, $data['default']);
+    }
+  }
+  // Install our vocabularies
+
+  _chapter_install_vocabulary();
+
+  // Create fields that are used throughout the chapter suite of modules
+
+  foreach (_chapter_installed_fields() as $field) {
+    // Only add it if we cannot find an existing entry
+
+    $existing_field = field_info_field($field['field_name']);
+
+    if (empty($existing_field)) {
+      field_create_field($field);
+    }
+  }
+  // Rebuild the node types and get an array of the current types
+
+  node_types_rebuild();
+  $types = node_type_get_types();
+
+  // Add contact, physical location, and electronic information node types.
+  // The location and electronic info are created first since the contact
+  // content will reference them
+
+  _chapter_install_electronic_node_type($types);
+  _chapter_install_location_node_type($types);
+  _chapter_install_chapter_node_type($types);
+  _chapter_install_membership_node_type($types);
+  _chapter_install_board_node_type($types);
+  _chapter_install_contact_node_type($types);
+
+  // For the nodes, define a weight variable to control export sequencing
+
+  $tmp_value = variable_get('chapter_node_type_weights');
+
+  if (empty($tmp_value)) {
+    variable_set('chapter_node_type_weights', _chapter_node_export_weights());
+  }
+  //  role permissions for content types
+
+  _chapter_create_roles(CHAPTER_ASSIGN_ROLES_ON_INSTALL);
+
+  // Since we have added quite a bit, and permissions may have been modified, a
+  // flush of the caches are in order
+
+  cache_clear_all();
+}
+
+/**
+ * Implements hook_uninstall()
+ *
+ * Remove any information that the module sets.
+ *
+ * The information that the module should remove includes:
+ *
+ *  o variables that the module has set using variable_set() or
+ *    system_settings_form()
+ *  o modifications to existing tables
+ *
+ * The module should not remove its entry from the {system} table.  Database
+ * tables defined by hook_schema() will be removed automatically. The uninstall
+ * hook will fire when the module gets uninstalled but before the module's
+ * database tables are removed, allowing your module to query its own tables
+ * during this routine.
+ */
+function chapter_uninstall() {
+  watchdog('chapter', 'Uninstalling core module');
+
+  // Gather all the example content that might have been created while this
+  // module was enabled.  Do in reverse order of dependencies.  The dependencies
+  // are described in the header of the chapter_node_export_alter().  When
+  // referential integrity is eventually enforced, this will help insure we
+  // clean things up in order
+
+  foreach(_chapter_node_export_weights() as $node_type => $weight) {
+
+    watchdog('chapter', 'Uninstalling node type ' . $node_type);
+
+    _chapter_uninstall_node_type($node_type);
+  }
+  watchdog('chapter', 'After node uninstalls');
+
+  $keep_type = variable_get('chapter_retain_content_types', FALSE);
+
+  if (!$keep_type) {
+    // Uninstall our common 'core' field types for the chapter suite of modules
+
+    watchdog('chapter', 'Deleting fields');
+
+    foreach (array_keys(_chapter_installed_fields()) as $field) {
+      field_delete_field($field);
+    }
+    // Purge most, if not all, field information.  If more than a thousand
+    // records exist, the periodic cron() task should slowly drain what is left.
+
+    field_purge_batch(1000);
+  }
+  watchdog('chapter', 'After field deletes');
+  // Delete any roles we created
+
+  $keep_roles = variable_get('chapter_retain_roles', FALSE);
+
+  if (!$keep_roles) {
+    _chapter_delete_roles();
+  }
+  watchdog('chapter', 'After role deletes');
+  // Unistall our vocabularies
+
+  _chapter_uninstall_vocabularies();
+  watchdog('chapter', 'After vocabulary uninstalls');
+
+  // Unset any variables this module defines
+
+  $keep_vars = variable_get('chapter_retain_variables', FALSE);
+
+  if (!$keep_vars) {
+    watchdog('chapter', 'Deleting variables');
+
+    foreach (_chapter_installed_variables() as $variable => $data) {
+      // Only attempt delete if it does not exist
+
+      $tmp_value = variable_get($variable);
+
+      watchdog('chapter', 'deleting variable ' . $variable);
+
+      if ($tmp_value != NULL) {
+        variable_del($variable);
+      }
+    }
+  }
+  watchdog('chapter', 'After variable deletes');
+  // Flush all caches so no artifacts remain...
+
+  cache_clear_all();
+}
+
+/**
+ * Remove all chapter node type information for the provided type
+ */
+function _chapter_uninstall_node_type($type) {
+
+  watchdog('chapter', 'Uninstalling ' . $type . ' node type');
+
+  $keep_data = variable_get('chapter_retain_content', FALSE);
+  $keep_type = variable_get('chapter_retain_content_types', FALSE);
+
+  if (node_type_get_type($type) != FALSE) {
+
+    if (!$keep_data || !$keep_type)
+    {
+      $sql    = 'SELECT nid FROM {node} n WHERE n.type = :type';
+      $result = db_query($sql, array(':type' => $type));
+      $nids   = array();
+
+      foreach ($result as $row) {
+        $nids[] = $row->nid;
+      }
+      // Now delete all the nodes at once
+
+      node_delete_multiple($nids);
+    }
+    if (!$keep_type) {
+      // Loop over any remaining field instances attached to this node's'
+      // content type (such as the body field) and delete them individually
+
+      $instances = field_info_instances('node', $type);
+
+      foreach ($instances as $instance_name => $instance) {
+        field_delete_instance($instance);
+      }
+      // delete our content type
+
+      node_type_delete($type);
+    }
+  }
+}
+
+
+/**
+ * Add a physical location type
+ */
+function _chapter_install_location_node_type(&$types) {
+
+  watchdog('chapter', 'Installing location node type');
+
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t = get_t();
+
+  // Define the node type.  The 'custom' flag is set to true so that
+  // the content type cannot be deleted via the UI, only programatically
+
+  $node = array(
+    'type'        => 'chapter_location',
+    'name'        => $t('Physical Address'),
+    'title_label' => $t('Brief Description'),
+    'base'        => 'node_content',
+    'module'      => 'chapter',
+// TODO enable later    'custom'      => FALSE,
+    'description' => $t('Provides additional physical contact information for ' .
+                        'for a contact.  For the core node types, the contact ' .
+                        'node will reference one or more Physical Address nodes.'),
+    // Help for a node is used as the submission guidelines
+    'help'        => $t('The contents of a physical location node are private and only ' .
+                        'viewable by owners of related contact nodes and to administrative ' .
+                        'personel.  Portions of the node content are also temporarily ' .
+                        'viewable to valid registered event attendies if the node is used ' .
+                        'as the location of an event until the end of the event.  For all ' .
+                        'other possible uses, only the Brief Description title is used for ' .
+                        'display and for seeding of selection lists when events are initially ' .
+                        'created.'),
+  );
+  // Complete the node type definition by setting any defaults not explicitly
+  // declared above
+
+  $content_type = node_type_set_defaults($node, $t('Notes'));
+  node_add_body_field($content_type);
+
+  // Save the content type
+
+  node_type_save($content_type);
+
+  // Disable the promote to front
+
+  variable_set('node_options_chapter_location', array('status'));
+
+  // Create all the instances of our fields
+
+  foreach (_chapter_location_installed_instances() as $instance) {
+    $instance['entity_type'] = 'node';
+    $instance['bundle']      = 'chapter_location';
+
+    field_create_instance($instance);
+  }
+  // Load the instance definition for our content type's body.  We do
+  // this after creating the other instances since adding instances will
+  // set the display weight based off the last existing field.  If we did
+  // this before creating the other field instances, it would still end
+  // up putting the body near the top in the default display
+
+  $body_instance = field_info_instance('node', 'body', 'chapter_location');
+
+  // Force the body label to be 'Notes' since the 'add' above only
+  // sets the label if the instance does not already exist.
+
+  $body_instance['label']                        = $t('Notes');
+  $body_instance['type']                         = 'text_textarea';
+  $body_instance['display']['default']['label']  = 'above';
+  $body_instance['display']['default']['weight'] = 90;
+
+  // Save our changes to the body field instance.
+
+  field_update_instance($body_instance);
+}
+
+/**
+ * Return a structured array defining the field instances for the contact
+ * content type
+ */
+function _chapter_location_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t = get_t();
+
+  return array(
+    'chapter_location_premise' => array(
+      'field_name' => 'chapter_premise',
+      'label'      => $t('Address'),
+      'required'   => TRUE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_sub_premise' => array(
+      'field_name' => 'chapter_subpremise',
+      'label'      => $t(''),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'hidden',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_locality' => array(
+      'field_name' => 'chapter_locality',
+      'label'      => $t('City'),
+      'required'   => TRUE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_state' => array(
+      'field_name' => 'chapter_state',
+      'label'      => $t('State'),
+      'required'   => TRUE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_postal_code' => array(
+      'field_name' => 'chapter_postalcode',
+      'label'      => $t('Postal Code'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_country' => array(
+      'field_name' => 'chapter_country',
+      'label'      => $t('Country'),
+      'required'   => TRUE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_location_directions' => array(
+      'field_name'  => 'chapter_directions',
+      'label'       => $t('Directions'),
+      'format'      => 'filtered_html',
+      'description' => $t('Please provide driving directions to this location'),
+      'widget'      => array(
+        'type'     => 'text_textarea',
+        'settings' => array(
+          'rows' => 10,
+        ),
+      ),
+      'settings'   => array(
+        'text_processing' => 1,
+        'display_summary' => FALSE
+      ),
+      'display'    => array(
+        'default' => array(
+          'label' => 'above',
+          'type'  => 'text',
+          'rows'  => 8,
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Add a email, sms, and website node type
+ */
+function _chapter_install_electronic_node_type(&$types) {
+
+  watchdog('chapter', 'Installing electronic node type');
+
+  // Only create it if not already installed
+
+  if (!node_type_get_type('chapter_electronic')) {
+    // use get_t() to get the name of our localization function for translation
+    // during install, when t() is not available.
+
+    $t = get_t();
+
+    // Define the node type.  The 'custom' flag is set to true so that
+    // the content type cannot be deleted via the UI, only programatically.
+
+    $node = array(
+      'type'        => 'chapter_electronic',
+      'name'        => $t('Electronic Address'),
+      'base'        => 'node_content',
+      'module'      => 'chapter',
+// TODO: Enable later      'custom'      => FALSE,
+      'description' => $t('Provides additional electronic/WWW contact information for ' .
+                          'for a contact.  For the core node types, the contact ' .
+                          'node will reference one or more Electronic Address nodes.'),
+      // Help for a node is used as the submission guidelines
+      'help'        => $t('For title, provide a brief name that will be viewale by the ' .
+                          'general public.  Actual contents of this node are private and ' .
+                          'viewable only by linked contacts and administrative personel'),
+    );
+    // Complete the node type definition by setting any defaults not explicitly
+    // declared above
+
+    $content_type = node_type_set_defaults($node);
+    node_add_body_field($content_type, $t('Notes'));
+
+    // Save the content type
+
+    node_type_save($content_type);
+
+    // Disable the promote to front
+
+    variable_set('node_options_chapter_electronic', array('status'));
+
+    // Create all the instances of our fields
+
+    foreach (_chapter_electronic_installed_instances() as $instance) {
+      $instance['entity_type'] = 'node';
+      $instance['bundle']      = 'chapter_electronic';
+
+      field_create_instance($instance);
+    }
+    // Load the instance definition for our content type's body.  We do
+    // this after creating the other instances since adding instances will
+    // set the display weight based off the last existing field.  If we did
+    // this before creating the other field instances, it would still end
+    // up putting the body near the top in the default display.
+
+    $body_instance = field_info_instance('node', 'body', 'chapter_electronic');
+
+    // Force the body label to be 'Notes' since the 'add' above only
+    // sets the label if the instance does not already exist.
+
+    $body_instance['label']                        = $t('Notes');
+    $body_instance['type']                         = 'text_textarea';
+    $body_instance['display']['default']['label']  = 'above';
+    $body_instance['display']['default']['weight'] = 90;
+
+    // Save our changes to the body field instance.
+
+    field_update_instance($body_instance);
+  }
+}
+
+/**
+ * Return a structured array defining the field instances for the contact
+ * content type
+ */
+function _chapter_electronic_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+  $t = get_t();
+
+  return array(
+    'chapter_email_url' => array(
+      'field_name'  => 'chapter_email_url',
+      'label'       => $t('Email'),
+      'widget'      => array(
+        'type'     => 'link_field',
+      ),
+      'display'     => array(
+        'default'  => array(
+          'label' => 'inline',
+          'type'  => 'link_field',
+        ),
+      ),
+    ),
+    'chapter_www_url' => array(
+      'field_name'  => 'chapter_www_url',
+      'label'       => $t('WWW'),
+      'widget'      => array(
+        'type'     => 'link_field',
+      ),
+      'display'     => array(
+        'default'  => array(
+          'label' => 'inline',
+          'type'  => 'link_field',
+        ),
+      ),
+    ),
+    'chapter_sms' => array(
+      'field_name'  => 'chapter_sms',
+      'label'       => $t('SMS'),
+      'description' => $t('Enter users SMS number/address'),
+      'widget'      => array('type' => 'text_textfield',),
+      'display'     => array(
+        'default'  => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Add a 'person or place' contact type
+ */
+function _chapter_install_contact_node_type(&$types) {
+
+  watchdog('chapter', 'Installing contact node type');
+
+  // Only create it if not already installed
+
+  if (!node_type_get_type('chapter_contact')) {
+    // use get_t() to get the name of our localization function for translation
+    // during install, when t() is not available.
+
+    $t = get_t();
+
+    // Define the node type.  The 'custom' flag is set to true so that
+    // the content type cannot be deleted via the UI, only programatically.
+
+    $node = array(
+      'type'        => 'chapter_contact',
+      'name'        => $t('Contact'),
+      'title_label' => $t('Full Name'),
+      'base'        => 'node_content',
+      'module'      => 'chapter',
+// TODO enable later      'custom'      => FALSE,
+      'description' => $t('Provides contact for a person or business that may or ' .
+                          'may not have a user account.  For the core node types, ' .
+                          'a Contact node will reference zero or more Physical Address' .
+                          'nodes, zero or more Electronic Address nodes, and optionally' .
+                          'a User account/entity.'),
+      // Help for a node is used as the submission guidelines
+      'help'        => $t('Provide a brief description for the Full Name title that can ' .
+                          'be used in most public displays of this contact.  Actual node ' .
+                          'contents are private to the user and viewable only by them and ' .
+                          'administrative personel.'),
+    );
+    // Complete the node type definition by setting any defaults not explicitly
+    // declared above
+
+    $content_type = node_type_set_defaults($node, $t('Notes'));
+    node_add_body_field($content_type);
+
+    // Save the content type
+
+    node_type_save($content_type);
+
+    // Disable the promote to front
+
+    variable_set('node_options_chapter_contact', array('status'));
+
+    // Create all the instances of our fields
+
+    foreach (_chapter_contact_installed_instances() as $instance) {
+      $instance['entity_type'] = 'node';
+      $instance['bundle']      = 'chapter_contact';
+
+      field_create_instance($instance);
+    }
+    // Load the instance definition for our content type's body.  We do
+    // this after creating the other instances since adding instances will
+    // set the display weight based off the last existing field.  If we did
+    // this before creating the other field instances, it would still end
+    // up putting the body near the top in the default display
+
+    $body_instance = field_info_instance('node', 'body', 'chapter_contact');
+
+    // Force the body label to be 'Notes' since the 'add' above only
+    // sets the label if the instance does not already exist.
+
+    $body_instance['label']                        = $t('Notes');
+    $body_instance['type']                         = 'text_textarea';
+    $body_instance['display']['default']['label']  = 'above';
+    $body_instance['display']['default']['weight'] = 90;
+
+    // Save our changes to the body field instance.
+
+    field_update_instance($body_instance);
+
+    // Touch up user entity to contain backwards node-id for associated contact.
+    // If missing or zero in a row, then no chapter contact has been associated
+    // with the account.
+  }
+}
+
+/**
+ * Return a structured array defining the field instances for the contact
+ * content type
+ */
+function _chapter_contact_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t             = get_t();
+  $use_relations = variable_get('chapter_use_relations', FALSE);
+
+  return array(
+    'chapter_contact_title' => array(
+      'field_name' => 'chapter_contact_title',
+      'label'      => $t('Title'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_first_name' => array(
+      'field_name' => 'chapter_contact_first_name',
+      'label'      => $t('First Name'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_middle_name' => array(
+      'field_name' => 'chapter_contact_middle_name',
+      'label'      => $t('Middle Name or Initial'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_last_name' => array(
+      'field_name' => 'chapter_contact_last_name',
+      'label'      => $t('Last Name'),
+      'required'   => TRUE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_nickname' => array(
+      'field_name' => 'chapter_contact_nickname',
+      'label'      => $t('Nickname'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_suffix' => array(
+      'field_name' => 'chapter_contact_suffix',
+      'label'      => $t('Suffix'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_home_number' => array(
+      'field_name' => 'chapter_home_number',
+      'label'      => $t('Home Phone'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_work_number' => array(
+      'field_name' => 'chapter_work_number',
+      'label'      => $t('Work Phone'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_cell_number' => array(
+      'field_name' => 'chapter_cell_number',
+      'label'      => $t('Mobile/Cell Phone'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_fax_number' => array(
+      'field_name' => 'chapter_fax_number',
+      'label'      => $t('FAX'),
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_contact_user_account' => array(
+      'field_name' => 'chapter_user_account',
+      'label'      => $t('User Account'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_contact_primary_address' => array(
+      'field_name' => 'chapter_primary_address',
+      'label'      => $t('Primary Address'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_contact_secondary_address' => array(
+      'field_name' => 'chapter_secondary_address',
+      'label'      => $t('Secondary Address'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_contact_primary_email' => array(
+      'field_name' => 'chapter_primary_email',
+      'label'      => $t('Primary Email/WWW address'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_contact_secondary_email' => array(
+      'field_name' => 'chapter_secondary_email',
+      'label'      => $t('Secondary Email/WWW address'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_contact_membership' => array(
+      'field_name' => 'chapter_contact_membership',
+      'label'      => $t('Chapter Membership Link'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+  );
+}
+
+/**
+ * Add a node type that links a contact to a particular chapter.
+ */
+function _chapter_install_membership_node_type(&$types) {
+
+  watchdog('chapter', 'Installing membership node type');
+
+  // Only create it if not already installed
+
+  if (!node_type_get_type('chapter_membership')) {
+    // use get_t() to get the name of our localization function for translation
+    // during install, when t() is not available.
+
+    $t = get_t();
+
+    // Define the node type.  The 'custom' flag is set to true so that
+    // the content type cannot be deleted via the UI, only programatically.
+
+    $node = array(
+      'type'        => 'chapter_membership',
+      'name'        => $t('Membership'),
+      'title_label' => $t('Membership'),
+      'base'        => 'node_content',
+      'module'      => 'chapter',
+// TODO enable later      'custom'      => FALSE,
+
+      'description' => $t('Links an individual contact to a particular chapter.  ' .
+                          'Currently a contact can only be a member of a single chapter ' .
+                          'but it is expected that association with other chapters will ' .
+                          'be supported in the future.'),
+      // Help for a node is used as the submission guidelines
+      'help'        => $t('Provide a brief description for the title.  This field may ' .
+                          'eventually be removed in the future. <br />' .
+                          'For the membership dates, enter you best estimate when the ' .
+                          'member joined.  The \'to\' date is optional and can be used for ' .
+                          'when the membership expires.  Leave the \'to\' date blank if ' .
+                          'the membership does not expire.'),
+    );
+    // Complete the node type definition by setting any defaults not explicitly
+    // declared above
+
+    $content_type = node_type_set_defaults($node, $t('Notes'));
+    node_add_body_field($content_type);
+
+    // Save the content type
+
+    node_type_save($content_type);
+
+    // Disable the promote to front
+
+    variable_set('node_options_chapter_membership', array('status'));
+
+    // Create all the instances of our fields
+
+    foreach (_chapter_membership_installed_instances() as $instance) {
+      $instance['entity_type'] = 'node';
+      $instance['bundle']      = 'chapter_membership';
+
+      field_create_instance($instance);
+    }
+    // Load the instance definition for our content type's body.  We do
+    // this after creating the other instances since adding instances will
+    // set the display weight based off the last existing field.  If we did
+    // this before creating the other field instances, it would still end
+    // up putting the body near the top in the default display
+
+    $body_instance = field_info_instance('node', 'body', 'chapter_membership');
+
+    // Force the body label to be 'Notes' since the 'add' above only
+    // sets the label if the instance does not already exist.
+
+    $body_instance['label']                        = $t('Notes');
+    $body_instance['type']                         = 'text_textarea';
+    $body_instance['display']['default']['label']  = 'above';
+    $body_instance['display']['default']['weight'] = 90;
+
+    // Save our changes to the body field instance.
+
+    field_update_instance($body_instance);
+  }
+}
+
+/**
+ * Return a structured array defining the field instances for the contact
+ * content type
+ */
+function _chapter_membership_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t             = get_t();
+  $use_relations = variable_get('chapter_use_relations', FALSE);
+
+  // Get the default membership type TID
+
+  $tid = NULL;
+  $vid = variable_get('chapter_member_type_vocabulary', 0);
+
+  if ($vid > 0) {
+    // Get the term
+    //
+    // @todo This form of lookup (conditions) is deprecated and will go away
+    //       in Drupal 8
+
+    $termList = entity_load('taxonomy_term', array(),
+                            array('name' => 'Active', 'vid' => $vid));
+    if (!empty($termList)) {
+
+      // Use only the first item of the array.  Should be a Term object
+
+      $term = array_shift($termList);
+
+      if (is_object($term)) {
+         $tid = array(array('tid' => $term->tid),);
+      }
+    }
+  }
+
+  return array(
+    'chapter_membership_id' => array(
+      'field_name'  => 'chapter_membership_id',
+      'label'       => $t('Membership ID'),
+      'description' => $t('Enter alphanumeric membership ID.  Leave blank if not used.'),
+      'required'   => FALSE,
+      'widget'     => array('type' => 'text_textfield',),
+      'display'    => array(
+        'default' => array(
+          'label' => 'inline',
+          'type'  => 'text',
+        ),
+      ),
+    ),
+    'chapter_membership_date' => array(
+      'field_name'  => 'chapter_membership_date',
+      'module'      => 'date',
+      'label'       => $t('Membership Date'),
+      'description' => $t('The \'to\' date is optional and may be left blank'),
+      'required'   => TRUE,
+      'settings'   => array(
+        'default_value'  => 'now',
+        'default_format' => 'medium',
+      ),
+      'widget'     => array(
+        'type'     => 'date_select',
+        'module'   => 'date',
+        'settings' => array(
+          'year_range'     => '-50:+10',
+          'label_position' => 'above',
+        ),
+      ),
+      'display'    => array(
+        'default' => array(
+          'label'    => 'inline',
+          'type'     => 'date_default',
+          'module'   => 'date',
+          'settings' => array(
+            'format_type' => 'long',
+          ),
+        ),
+      ),
+    ),
+    'chapter_membership_date_accurate' => array(
+      'field_name'  => 'chapter_membership_date_accurate',
+      'label'       => $t('Join Date Accurate'),
+      'description' => $t('Select this if the join date above is accurate and not a ' .
+                          'rough estimate.'),
+      'required'   => TRUE,
+      'widget'     => array(
+        'type'     => 'options_onoff',
+        'module'   => 'options',
+        'settings' => array('display_label' => 1),
+      ),
+      'display'    => array(
+        'default' => array(
+          'label'  => 'inline',
+          'type'   => 'list_default',
+          'module' => 'list',
+        ),
+      ),
+      'default_value_php'      => '',
+      'default_value_function' => '',
+      'default_value'          => array(array(0 => 1),),
+    ),
+    'chapter_membership_type' => array(
+      'field_name'    => 'chapter_membership_type',
+      'label'         => $t('Membership Type'),
+      'description'   => $t('Select the type of membership item(s) that best ' .
+                            'describes this contact'),
+      'required'      => 1,
+      'default_value' => $tid,
+      'widget'        => array(
+        'type'     => 'options_buttons',
+        'module'   => 'options',
+        'active'   => 1,
+        'settings' => array(),
+      ),
+      'settings'      => array('user_register_form' => FALSE),
+      'display'       => array(
+        'default' => array(
+          'label'  => 'inline',
+          'type'   => 'taxonomy_term_reference_link',
+          'module' => 'taxonomy',
+        ),
+      ),
+    ),
+    'chapter_membership_chapter' => array(
+      'field_name'  => 'chapter_membership_chapter',
+      'label'       => $t('Chapter'),
+      'description' => $t('Select the associated chapter the member belongs to.'),
+      'widget'      => array(
+        'type'   => $use_relations ? 'relation_default' : 'options_select',
+        'module' => $use_relations ? 'relation' : 'options',
+      ),
+      'display'     => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+  );
+}
+
+/**
+ * Add a chapter type
+ */
+function _chapter_install_chapter_node_type(&$types) {
+
+  watchdog('chapter', 'Installing chapter node type');
+
+  // Only create it if not already installed
+
+  if (!node_type_get_type('chapter_chapter')) {
+    // use get_t() to get the name of our localization function for translation
+    // during install, when t() is not available.
+
+    $t = get_t();
+
+    // Define the node type.  The 'custom' flag is set to true so that
+    // the content type cannot be deleted via the UI, only programatically.
+
+    $node = array(
+      'type'         => 'chapter_chapter',
+      'name'         => $t('Chapter'),
+      'title_label'  => $t('Chapter Name'),
+      'base'         => 'node_content',
+      'module'       => 'chapter',
+// TODO enable later      'custom'       => FALSE,
+      'description'  => $t('Provides information on a particular chapter.  Most ' .
+                           'implementations will define only a single chapter ' .
+                           'instance, but if needed, multiple instances may be defined.'),
+    );
+    // Complete the node type definition by setting any defaults not explicitly
+    // declared above
+
+    $content_type = node_type_set_defaults($node, $t('Notes'));
+    node_add_body_field($content_type);
+
+    // Save the content type
+
+    node_type_save($content_type);
+
+    // Disable the promote to front
+
+    variable_set('node_options_chapter_chapter', array('status'));
+
+    // Create all the instances of our fields
+
+    foreach (_chapter_chapter_installed_instances() as $instance) {
+      $instance['entity_type'] = 'node';
+      $instance['bundle']      = 'chapter_chapter';
+
+      field_create_instance($instance);
+    }
+    // Load the instance definition for our content type's body.  We do
+    // this after creating the other instances since adding instances will
+    // set the display weight based off the last existing field.  If we did
+    // this before creating the other field instances, it would still end
+    // up putting the body near the top in the default display
+
+    $body_instance = field_info_instance('node', 'body', 'chapter_chapter');
+
+    // Force the body label to be 'Notes' since the 'add' above only
+    // sets the label if the instance does not already exist.
+
+    $body_instance['label']                        = $t('Notes');
+    $body_instance['type']                         = 'text_textarea';
+    $body_instance['display']['default']['label']  = 'above';
+    $body_instance['display']['default']['weight'] = 90;
+
+    // Save our changes to the body field instance.
+
+    field_update_instance($body_instance);
+  }
+}
+
+/**
+ * Return a structured array defining the field instances for the chapter
+ * content type
+ */
+function _chapter_chapter_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t             = get_t();
+  $use_relations = variable_get('chapter_use_relations', FALSE);
+
+  $instances = array(
+    'chapter_chapter_active' => array(
+      'field_name'  => 'chapter_chapter_active',
+      'type'        => 'text',
+      'label'       => $t('Active'),
+      'description' => $t('Select if the Chapter is active and providing service to members.'),
+      'required'   => TRUE,
+      'widget'     => array(
+        'type'     => 'options_onoff',
+        'module'   => 'options',
+        'settings' => array('display_label' => 1),
+      ),
+      'display'    => array(
+        'default' => array(
+          'label'  => 'inline',
+          'type'   => 'list_default',
+          'module' => 'list',
+        ),
+      ),
+      'default_value_php'      => '',
+      'default_value_function' => '',
+      'default_value'          => array(array(0 => 1),),
+    ),
+    'chapter_chapter_address' => array(
+      'field_name' => 'chapter_primary_address',
+      'label'      => $t('Mailing Address'),
+      'description' => $t('Provide the primary mailing address for the chapter'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_chapter_email' => array(
+      'field_name' => 'chapter_primary_email',
+      'label'      => $t('Email/WWW address'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_board_current' => array(
+      'field_name' => 'chapter_board_current',
+      'label'      => $t('Current Board'),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+  );
+  return $instances;
+}
+
+/**
+ * Add a chapter board type
+ *
+ *  Keeps track of past and current board positions
+ */
+function _chapter_install_board_node_type(&$types) {
+
+  watchdog('chapter', 'Installing board node type');
+
+  // Only create it if not already installed
+
+  if (!node_type_get_type('chapter_board')) {
+    // use get_t() to get the name of our localization function for translation
+    // during install, when t() is not available.
+
+    $t = get_t();
+
+    // Define the node type.  The 'custom' flag is set to true so that
+    // the content type cannot be deleted via the UI, only programatically.
+
+    $node = array(
+      'type'         => 'chapter_board',
+      'name'         => $t('Board'),
+      'title_label'  => $t('Title'),
+      'base'         => 'node_content',
+      'module'       => 'chapter',
+// TODO enable later      'custom'       => FALSE,
+      'description'  => $t('Provides information on chapter\'s board members.  Both past ' .
+                           'and present board members may be tracked with this content type.'),
+    );
+    // Complete the node type definition by setting any defaults not explicitly
+    // declared above
+
+    $content_type = node_type_set_defaults($node, $t('Notes'));
+    node_add_body_field($content_type);
+
+    // Save the content type
+
+    node_type_save($content_type);
+
+    // Disable the promote to front
+
+    variable_set('node_options_chapter_board', array('status'));
+
+    // Create all the instances of our fields
+
+    foreach (_chapter_board_installed_instances() as $instance) {
+      $instance['entity_type'] = 'node';
+      $instance['bundle']      = 'chapter_board';
+
+      field_create_instance($instance);
+    }
+    // Load the instance definition for our content type's body.  We do
+    // this after creating the other instances since adding instances will
+    // set the display weight based off the last existing field.  If we did
+    // this before creating the other field instances, it would still end
+    // up putting the body near the top in the default display
+
+    $body_instance = field_info_instance('node', 'body', 'chapter_board');
+
+    // Force the body label to be 'Notes' since the 'add' above only
+    // sets the label if the instance does not already exist.
+
+    $body_instance['label']                        = $t('Notes');
+    $body_instance['type']                         = 'text_textarea';
+    $body_instance['display']['default']['label']  = 'above';
+    $body_instance['display']['default']['weight'] = 90;
+
+    // Save our changes to the body field instance.
+
+    field_update_instance($body_instance);
+  }
+}
+
+/**
+ * Return a structured array defining the field instances for the chapter board
+ * content type
+ */
+function _chapter_board_installed_instances() {
+  // use get_t() to get the name of our localization function for translation
+  // during install, when t() is not available.
+
+  $t             = get_t();
+  $use_relations = variable_get('chapter_use_relations', FALSE);
+
+  $instances = array(
+    'chapter_board_tenure' => array(
+      'field_name'  => 'chapter_board_tenure',
+      'module'      => 'date',
+      'label'       => $t('Board Tenure'),
+      'description' => $t('The \'to\' date is optional and may be left blank'),
+      'required'   => TRUE,
+      'settings'   => array(
+        'default_value'  => 'now',
+        'default_format' => 'medium',
+      ),
+      'widget'     => array(
+        'type'     => 'date_select',
+        'module'   => 'date',
+        'settings' => array(
+          'year_range'     => '-50:+10',
+          'label_position' => 'above',
+        ),
+      ),
+      'display'    => array(
+        'default' => array(
+          'label'    => 'inline',
+          'type'     => 'date_default',
+          'module'   => 'date',
+          'settings' => array(
+            'format_type' => 'long',
+          ),
+        ),
+      ),
+    ),
+    'chapter_chair_contact' => array(
+      'field_name' => 'chapter_chair_contact',
+      'label'      => $t(variable_get('chapter_chair', CHAPTER_CHAIR_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_treasurer_contact' => array(
+      'field_name' => 'chapter_treasurer_contact',
+      'label'      => $t(variable_get('chapter_treasurer', CHAPTER_TREASURER_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_editor_contact' => array(
+      'field_name' => 'chapter_editor_contact',
+      'label'      => $t(variable_get('chapter_editor', CHAPTER_EDITOR_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_secretary_contact' => array(
+      'field_name' => 'chapter_secretary_contact',
+      'label'      => $t(variable_get('chapter_secretary', CHAPTER_SECRETARY_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_education_contact' => array(
+      'field_name' => 'chapter_education_contact',
+      'label'      => $t(variable_get('chapter_education', CHAPTER_EDUCATION_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_webmaster_contact' => array(
+      'field_name' => 'chapter_webmaster_contact',
+      'label'      => $t(variable_get('chapter_webmaster', CHAPTER_WEBMASTER_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+    'chapter_programs_contact' => array(
+      'field_name' => 'chapter_programs_contact',
+      'label'      => $t(variable_get('chapter_programs', CHAPTER_PROGRAMS_DEFAULT)),
+      'widget'     => array(
+        'type'     => $use_relations ? 'relation_default' : 'options_select',
+        'module'   => $use_relations ? 'relation' : 'options',
+      ),
+      'display'    => array(
+        'default' => array('label' => 'inline',),
+      ),
+    ),
+  );
+// TODO: Add optional fields later or determine a way to do it externally
+//
+//  $optional_position = $t(variable_get('chapter_other_1', CHAPTER_UNASSIGNED_POSITION));
+//
+//  if ($optional_position != CHAPTER_UNASSIGNED_POSITION) {
+//    $instances['chapter_other_1_contact'] = array(
+//      'field_name' => 'chapter_other_1_contact',
+//      'label'      => $optional_position,
+//      'widget'     => array(
+//        'type'     => $use_relations ? 'relation_default' : 'options_select',
+//        'module'   => $use_relations ? 'relation' : 'options',
+//      ),
+//      'display'    => array(
+//        'default' => array('label' => 'inline',),
+//      ),
+//    );
+//  }
+//  $optional_position = $t(variable_get('chapter_other_2', CHAPTER_UNASSIGNED_POSITION));
+//
+//  if ($optional_position != CHAPTER_UNASSIGNED_POSITION) {
+//    $instances['chapter_other_2_contact'] = array(
+//      'field_name' => 'chapter_other_2_contact',
+//      'label'      => $optional_position,
+//      'widget'     => array(
+//        'type'     => $use_relations ? 'relation_default' : 'options_select',
+//        'module'   => $use_relations ? 'relation' : 'options',
+//      ),
+//      'display'    => array(
+//        'default' => array('label' => 'inline',),
+//      ),
+//    );
+//  }
+//  $optional_position = $t(variable_get('chapter_other_3', CHAPTER_UNASSIGNED_POSITION));
+//
+//  if ($optional_position != CHAPTER_UNASSIGNED_POSITION) {
+//    $instances['chapter_other_3_contact'] = array(
+//      'field_name' => 'chapter_other_3_contact',
+//      'label'      => $optional_position,
+//      'widget'     => array(
+//        'type'     => $use_relations ? 'relation_default' : 'options_select',
+//        'module'   => $use_relations ? 'relation' : 'options',
+//      ),
+//      'display'    => array(
+//        'default' => array('label' => 'inline',),
+//      ),
+//    );
+//  }
+//  $optional_position = $t(variable_get('chapter_other_4', CHAPTER_UNASSIGNED_POSITION));
+//
+//  if ($optional_position != CHAPTER_UNASSIGNED_POSITION) {
+//    $instances['chapter_other_4_contact'] = array(
+//      'field_name' => 'chapter_other_4_contact',
+//      'label'      => $optional_position,
+//      'widget'     => array(
+//        'type'     => $use_relations ? 'relation_default' : 'options_select',
+//        'module'   => $use_relations ? 'relation' : 'options',
+//      ),
+//      'display'    => array(
+//        'default' => array('label' => 'inline',),
+//      ),
+//    );
+//  }
+//  $optional_position = $t(variable_get('chapter_other_5', CHAPTER_UNASSIGNED_POSITION));
+//
+//  if ($optional_position != CHAPTER_UNASSIGNED_POSITION) {
+//    $instances['chapter_other_5_contact'] = array(
+//      'field_name' => 'chapter_other_5_contact',
+//      'label'      => $optional_position,
+//      'widget'     => array(
+//        'type'     => $use_relations ? 'relation_default' : 'options_select',
+//        'module'   => $use_relations ? 'relation' : 'options',
+//      ),
+//      'display'    => array(
+//        'default' => array('label' => 'inline',),
+//      ),
+//    );
+//  }
+  return $instances;
+}
+
+/**
+ * Create the roles that we will be using
+ */
+function _chapter_create_roles($assign_permissions = FALSE) {
+
+  watchdog('chapter', 'Creating roles');
+
+  $t = get_t();
+
+  $added_role      = FALSE;
+  $board_positions = _chapter_board_positions();
+
+  foreach($board_positions as $position => $attributes) {
+
+    // See if it already exists
+
+    $role_name = check_plain($attributes['name']);
+
+    // Skip roles with no name or that already exist
+
+    if (!empty($role_name) && user_role_load_by_name($role_name) == FALSE) {
+
+      // Create it
+
+      $role = new stdClass();
+      $role->name = $role_name;
+
+      user_role_save($role);
+
+      $added_role = TRUE;
+
+      // Assign permissions
+
+      if ($assign_permissions && !empty($attributes['permissions'])) {
+
+        _chapter_assign_permissions($role_name, $attributes['permissions']);
+      }
+    }
+  }
+  // Rebuild permissions if needed
+
+  if ($added_role) {
+
+    watchdog('chapter', 'Performing node rebuild to pick up permissions');
+
+    node_access_rebuild(TRUE);
+  }
+}
+
+/**
+ * Delete the roles that we created
+ */
+function _chapter_delete_roles() {
+  watchdog("Chapter", "Performing cleanup of module generated roles");
+
+  $removed_role    = FALSE;
+  $board_positions = _chapter_board_positions();
+
+  foreach($board_positions as $position => $attributes) {
+
+    $role_name = !empty($attributes['name']) ? $attributes['name'] : $position;
+
+    if (user_role_load_by_name($role_name)) {
+
+      user_role_delete($role_name);
+
+      $removed_role = TRUE;
+    }
+  }
+  // Rebuild permissions if needed
+
+  if ($removed_role) {
+    node_access_rebuild(TRUE);
+  }
+}
+
+/**
+ * Install our vocabularies
+ */
+function _chapter_install_vocabulary() {
+  // Get the entire vocabulary to install
+
+  watchdog("Chapter", "Installing vocabulary");
+
+  $vocabularies = _chapter_get_vocabulary();
+
+  foreach($vocabularies as $vocabulary) {
+    // See if it already exists
+
+    $vid            = variable_get($vocabulary['vid_variable'], 0);
+    $existing_vocab = taxonomy_vocabulary_load($vid);
+
+    if (($vid == 0) || empty($existing_vocab)) {
+      $vocab = array(
+        'name'         => $vocabulary['name'],
+        'machine_name' => $vocabulary['machine_name'],
+        'module'       => $vocabulary['module'],
+        'description'  => $vocabulary['description'],
+      );
+      // Create the vocabulary object
+
+      $vocabulary_obj = (object)$vocab;
+      taxonomy_vocabulary_save($vocabulary_obj);
+
+      $vid = $vocabulary_obj->vid;
+      variable_set($vocabulary['vid_variable'], $vid);
+    }
+    // Create the terms
+
+    foreach($vocabulary['terms'] as $term_data) {
+      // Set proper VID for term first
+
+      $term_data['vid'] = $vocabulary_obj->vid;
+
+      // Now save it
+
+      $term = (object)$term_data;
+      taxonomy_term_save($term);
+    }
+  }
+}
+
+/**
+ * Uninstall our vocabularies
+ *
+ * Remove any vocabularies that this module installed
+ */
+function _chapter_uninstall_vocabularies() {
+
+  watchdog("Chapter", "Removing vocabulary");
+
+  $vocabularies = _chapter_get_vocabulary();
+
+  foreach($vocabularies as $vocabulary) {
+
+    $vid = variable_get($vocabulary['vid_variable'], 0);
+
+    if ($vid > 0) {
+      taxonomy_vocabulary_delete($vid);
+    }
+  }
+}

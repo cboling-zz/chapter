@@ -1,0 +1,114 @@
+<?php
+// $Id:$
+/**
+ * @file
+ *
+ * This file contains simple tests related to node/content-types and thier
+ * associated fields.  The more complex node tests are maintained in their
+ * own file.
+ */
+class ChapterNodeSimpleTestCase extends DrupalWebTestCase {
+
+  //protected $web_user;
+  //protected $board_member;
+
+  /**
+   * Test information
+   *
+   * Enter description here ...
+   */
+  public static function getInfo() {
+    return array(
+      'name'         => 'Chapter Simple Content-Type Tests',
+      'description'  => 'Verify common/simple field instances in the core ' .
+                        'non-profit chapter content-types',
+      'group'        => 'A Non-Profit Chapter Module',
+      'dependencies' => array(
+        'field',
+        'field_ui',
+        'date_api',
+        'date',
+        'link',
+        'number',
+        'cck',
+        'options',
+        'taxonomy',
+        'token',
+        'references',
+        'node_reference',
+        'user_reference',
+      ),
+    );
+  }
+
+  /**
+   * Set up modules for our test cases
+   *
+   * The setup process calls this method to add in modules or other
+   * features that are not part of a base Drupal 7 core install.
+   */
+  protected function setUp() {
+    // Uncomment next to decrease how long our tests run.  It should
+    // be set before calling into the parent's setUp() method.  If debugging,
+    // you may want to set it > 600...
+
+    //$this->timeLimit = 120;
+
+    // Enable the 'chapter' module which is the target of this test
+
+    parent::setUp('chapter');
+
+    // Create all of our users to use for testing content operations
+
+    //$this->web_user = $this->drupalCreateUser();
+    //$this->drupalLogin($this->web_user);
+  }
+
+  /**
+   * Test minimal node/content-type properties
+   *
+   * All our content types should at a minimum have several fields defined to
+   * specific values so that they will behave as we intend them to.
+   */
+  function testNodeProperties() {
+    // Must have the following fields populated
+    //
+    // 'name', 'module', 'custom', 'description', 'help', 'base'
+    $text_indexes = array('name', 'module', 'description', 'help');
+
+    foreach(_chapter_node_export_weights() as $node_type => $weight) {
+
+      foreach($text_indexes as $index) {
+        // Test indexes to text fields
+
+        $this->assertTrue(isset($node_type[$index]) && !empty($node_type[$index]),
+                          'Index ' . $index . ' of content-type ' . $node_type['type'] .
+                          'is missing or empty',
+                          'content-type');
+        // Test others
+
+        $this->assertEqual($node_type['base'], 'node_content',
+						   'base property of content-type ' . $node_type['type'] .
+        				   ' is not set to \'node_content\'', 'content-type');
+
+        $this->assertFalse($node_type['custom'],
+                           'custom property of content-type ' . $node_type['type'] .
+        				   ' is not FALSE', 'content-type');
+      }
+    }
+  }
+
+  /**
+   * Location content-type simple tests
+   *
+   * Verify that the location fields instances exist and operate correctly.  These
+   * are the more simple tests.  Tests related to referential integrity,
+   * export/import, and so on are considered complex tests.
+   */
+  function testLocationFieldsInstances() {
+
+
+
+
+  }
+}

@@ -1,0 +1,499 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Chapter tools primary module file.
+ *
+ * Most of the chapter tools and modules are in their own .inc files and
+ * subdirectories. This contains file contains a few convenience functions
+ * and some hooks thatmust be implemented in the module file.
+ */
+
+/**
+ * Include the utility module
+ */
+//module_load_include('inc', 'chapter', 'chapter.util');
+//include_once('./includes/chapter.util.inc');
+include_once(DRUPAL_ROOT . '/' . drupal_get_path('module', 'chapter') . '/includes/chapter.util.inc');
+
+/**
+ * Global to improve speed of sorting of node export weights
+ */
+$_chapter_node_type_weights = array();
+
+/**
+ * Implements hook_help().
+ *
+ * @ingroup chapter_core
+ * @param $section the page which is requesting help
+ * @return the help text
+ */
+function chapter_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#chapter':
+      $output = '<p>' .
+                  t('The chapter module provides the core set of content-type ' .
+      				'and code to allow a small non-profit chapter or community ' .
+      				'organization to set up a website for their group.') .
+      			'</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_menu()
+ *
+ * Define our me
+ */
+function chapter_menu() {
+
+  $items = array();
+
+  // Administration
+
+  $items['admin/config/chapter'] = array(
+    'title'            => 'Non-profit chapter',
+    'description'      => 'Customized settings for the Chapter (Core) Module page',
+    'position'         => 'right',
+    'weight'           => -5,
+    'page callback'    => 'system_admin_menu_block_page',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'system.admin.inc',
+    'path'             => drupal_get_path('module', 'system'),
+  );
+
+  $items['admin/config/chapter/settings'] = array(
+    'title'            => 'Non-profit chapter module settings',
+    'description'      => 'Provides customized settings for the Chapter (Core) Module page',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_admin'),
+    'access arguments' => array('administer site configuration'),
+    'type'             => MENU_NORMAL_ITEM,
+    'weight'           => 10,
+    'file'             => 'chapter.admin.inc',
+  );
+  ////////////////////////////////////////////////////////////////
+  // Data entry forms for administrators
+
+  $items['chapter/forms'] = array(
+    'title'            => 'Chapter Tools',
+    'description'      => 'Chapter Administration Tools',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_intro_form'),
+    'access callback'  => '_chapter_admin_forms_access',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'includes/chapter.forms.inc',
+    'expanded'         => TRUE,
+  );
+  ////////////////////////////////////////////////////////////////
+  // New/Existing contact
+
+  $items['chapter/forms/contact'] = array(
+    'title'            => 'Contact Management',
+    'description'      => 'Add, Modify, and Delete Contact Information',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_contact_form'),
+    'access callback' => '_chapter_admin_forms_access',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'includes/chapter.contact.inc',
+    'type'             => MENU_NORMAL_ITEM,
+  );
+  $items['chapter/forms/contact/personal'] = array(
+    'title'            => 'Name and Phone Numbers',
+    'description'      => 'Contact Name Information',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_contact_form'),
+    'access callback' => '_chapter_admin_forms_access',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'includes/chapter.contact.inc',
+    'type'             => MENU_DEFAULT_LOCAL_TASK,
+    'weight'           => 0,
+  );
+  $items['chapter/forms/contact/address'] = array(
+    'title'            => 'Addresses',
+    'description'      => 'Physical Location and Electronic Address Information',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_address_form'),
+    'access callback' => '_chapter_admin_forms_access',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'includes/chapter.contact.inc',
+    'type'             => MENU_LOCAL_TASK,
+    'weight'           => 10,
+  );
+  $items['chapter/forms/contact/membership'] = array(
+    'title'            => 'Membership',
+    'description'      => 'Contact Membership Information',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('chapter_membership_form'),
+    'access callback' => '_chapter_admin_forms_access',
+    'access arguments' => array('administer site configuration'),
+    'file'             => 'includes/chapter.contact.inc',
+//    'path'             => 'includes',
+    'type'             => MENU_LOCAL_TASK,
+    'weight'           => 20,
+  );
+  return $items;
+}
+
+/**
+ * Access callback to check a combination of user_acess() and page access
+ *
+ * @param $permission
+ *   permission required to view the page
+ * @return
+ *   TRUE if the user has permission to view the page, FALSE otherwise
+ */
+function _chapter_admin_forms_access($permission) {
+  $page_access = TRUE;
+  return (user_access($permission) && $page_access);
+}
+
+/**
+ * Menu introduction
+ *
+ * This provides an introduction to our navigation menuts
+ */
+function form_chapter_intro()
+{
+  $intro = array(
+    '#prefix' => '<div class="tools-intro">',
+    '#markup' => t('The Non-Profit Chapter module provides a variety of tools that ' .
+                  'can be used to manage the day-to-day communications tasks of a ' .
+                  'small non-profit organization.<br ><br >' .
+                  'Based on your account\'s access rights and roles, the following ' .
+                  'tools are available:<br >'),
+    '#suffix' => '</div>',
+  );
+  return $intro;
+}
+
+/**
+ * Implements hook_menu_alter()
+ *
+ * TODO: This is not working and is not being called
+ */
+function chapter_menu_alter(&$items) {
+
+  // Allowed and do we want to hide our node types?
+  //
+  // Normally, you need to just change the 'create' rights but for
+  // simplification, we will allow only roles with 'administer content'
+  // rights to do it without having to go through a web form.
+
+  if (!user_access('administer nodes') &&
+      variable_get('chapter_hide_add_content', FALSE) == TRUE) {
+
+    // Hide this modules content types
+
+    $types = array(
+      'chapter-contact',
+      'chapter-electronic',
+      'chapter-location',
+      'chapter-chapter',
+      'chapter-membership',
+      'chapter-board');
+
+    foreach ($types as $type) {
+      $items['node/add/' . $type]['access callback'] = FALSE;
+      unset($items['node/add/' . $type]['access arguments']);
+    }
+  }
+}
+
+///**
+// * Implements hook_node_access()
+// */
+//function chapter_node_access($op, $node, $account) {
+//
+//  switch ($op) {
+//    case 'create':
+//      return (user_access('create x', $account)) ?
+//        NODE_ACCESS_ALLOW : NODE_ACCESS_DENY;
+//
+//    case 'update':
+//      if (user_access('edit own x', $account) && ($account->uid == $node->uid) ||
+//          user_access('edit any x', $account)) {
+//        return NODE_ACCESS_ALLOW;
+//      }
+//      break;
+//
+//    case 'delete':
+//      if (user_access('delete own x', $account) && ($account->uid == $node->uid) ||
+//          user_access('delete any x', $account)) {
+//        return NODE_ACCESS_ALLOW;
+//      }
+//      break;
+//  }
+//  return NODE_ACCESS_DENY;
+//}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * This method is used to adjust the weights on chapter content body (notes)
+ * fields and to clear off some of the promote/sticky/author settings.
+ */
+function chapter_form_alter(&$form, $form_state, $form_id) {
+//  if ($form_id != 'dblog_clear_log_form' &&
+//      $form_id != 'dblog_filter_form') {
+//   watchdog("Chapter", "chapter_form_alter: entry, Form ID: %id",
+//           array('%id' => $form_id));
+//  }
+  if ($form_id == 'chapter_contact_node_form' ||
+      $form_id == 'chapter_electronic_node_form' ||
+      $form_id == 'chapter_location_node_form' ||
+      $form_id == 'chapter_chapter_node_form' ||
+      $form_id == 'chapter_board_node_form' ||
+      $form_id == 'chapter_membership_node_form') {
+
+    // Adjust the weight of the body field so that it is just
+    // above the additional/menu settings area. In the most
+    // installations, this field has a weight of 99
+
+    $form['body']['#weight'] = 90;
+
+    // Adjust some display options
+
+    unset($form['author']);
+    unset($form['comment_settings']);
+    unset($form['promote']);
+    unset($form['sticky']);
+  }
+}
+
+/**
+ * Set permissions for a specific role for content types
+ *
+ *  Only create, update, and delete permissions are modified.  Since
+ *  chapter board positions change often, update-own and delete-own
+ *  do not make much sense.
+ *
+ * @params $role       Roles to assign permissions for
+ *
+ * @param  $attributes Permissions to assign
+ *
+ * @return TRUE if permissions were modified.  Caller is responsible
+ *         for calling node_access_rebuild(TRUE) to insure all permissions
+ *         take effect.
+ */
+function _chapter_assign_permissions($role, $attributes) {
+  // Set return value to default
+
+  $modified = FALSE;
+  $role_obj = user_role_load_by_name($role);
+
+  if (!empty($attributes) && $role_obj) {
+
+    // Walk each right and grant what is requested
+
+    foreach($attributes as $node_type => $rights) {
+
+      watchdog("Chapter", "Working on type %type for role ID %rid",
+               array('%type' => $node_type, '%rid' => $role_obj->rid));
+
+      // Make sure that the role type is valid
+
+      $type = node_type_get_type($node_type);
+
+      if ($type != FALSE) {
+        // See what is being allowed
+
+        $allow_create = (!empty($rights['create']) && $rights['create'])
+                     || (!empty($rights['all']) && $rights['all']);
+
+        $allow_update = (!empty($rights['update']) && $rights['update'])
+                     || (!empty($rights['all']) && $rights['all']);
+
+        $allow_delete = (!empty($rights['delete']) && $rights['delete'])
+                     || (!empty($rights['all']) && $rights['all']);
+
+        watchdog("Chapter", "Granting permissions for role %role on %type are %cr, %up, %de",
+                 array('%role' => $role, '%type' => $node_type,
+                       'cr' => $allow_create, 'up' => $allow_update,
+                       'cr' => $allow_delete));
+
+        if ($allow_create || $allow_update || $allow_delete) {
+          $permissions = array();
+
+          if ($allow_create) {
+            $permissions[] = 'create ' . $node_type . ' content';
+          }
+          if ($allow_update) {
+            $permissions[] = 'edit any ' . $node_type . ' content';
+          }
+          if ($allow_delete) {
+            $permissions[] = 'delete any ' . $node_type . ' content';
+          }
+          user_role_grant_permissions($role_obj->rid, $permissions);
+        }
+      }
+      else {
+        // TODO: Make this a real error message..
+
+        watchdog("Chapter", "Did not find node of type %type", array('%type' => $node_type));
+      }
+    }
+  }
+  return $modified;
+}
+
+/**
+ * Check that a string appears to be in the format of a UUID.
+ *
+ * @param $uuid
+ *  The string to test.
+ *
+ * @param $com_style
+ *  If true, the GUID should be inclosed in curly braces
+ *
+ * @return
+ *   Returns TRUE is the string is well formed.
+ */
+function _chapter_uuid_is_well_formed($uuid, $com_style = TRUE) {
+
+  $match_string = com_style ? '/^\{?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$/'
+                            : '/^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}?$/';
+
+  return !empty($uuid) && preg_match($match_string, $uuid);
+}
+
+/**
+ * Verify that the node and all revisions have a GUID assignd to them
+ */
+function _chapter_validate_node_guids(&$node, &$original_node, $add_if_needed = TRUE) {
+
+  $valid_guids = TRUE;
+
+  // Does the node itself have a well formed UUID
+
+  if (!_chapter_uuid_is_well_formed($node->export_uuid)) {
+    watchdog('chapter', "Bad GUID property for Node $node->type / $node->title");
+
+    if ($add_if_needed) {
+      watchdog('chapter', "Adding a GUID property for Node $node->type / $node->title");
+      $node->export_uuid = com_create_guid();   // Use PHP version for now
+
+      $original_node->export_uuid = $node->export_uuid;
+      node_save($original_node);
+    }
+    else {
+      $valid_guids = FALSE;
+    }
+  }
+  else {
+   watchdog('chapter', "Node $node->type / $node->title already has a UUID $node->export_uuid assigned");
+  }
+//  // Also validate all revisions of this node as well
+//
+//  $revision_list = node_revision_list($node);
+//  $rev_count = count($revision_list);
+//
+//  watchdog('chapter', "Node has $rev_count revisions");
+//
+//  foreach(node_revision_list($node) as $revision) {
+//    watchdog('chapter', "Working on rid $revision->rid of node $revision->nid");
+//
+//    // Check revision guid
+//    if (!_chapter_uuid_is_well_formed($revision->rev_uuid)) {
+//      watchdog('chapter', "Adding a GUID property for the node revision");
+// //       $revision->rev_uuid = com_create_guid();   // Use PHP version for now
+//    }
+//    else {
+//     watchdog('chapter', "Node revision already has a UUID $node->uuid assigned");
+//    }
+//  }
+  return $valid_guids;
+}
+
+/**
+ * Implements hook_node_export_node_alter()
+ *
+ * Manipulate a node on export.   Since
+ *
+ * @param &$node
+ *   The node to alter.
+ * @param $original_node
+ *   The unaltered node.
+ */
+function chapter_node_export_node_alter(&$node, $original_node) {
+  // Only do this if UUID is installed
+
+  $uuid_module_ok = module_exists('uuid');
+
+  if ($uuid_module_ok) {
+    watchdog('chapter', 'uuid module exists');
+
+    // Lookup the GUID for this node
+
+    _chapter_validate_node_guids($node, $original_node);
+
+    // Now, based on the node type, alter references to others by adding their GUID
+
+    switch ($node->type) {
+      case 'chapter-electronic':
+        // No relations to other entities
+        break;
+
+      case 'chapter_location':
+        // No relations to other entities
+        break;
+
+      case 'chapter_chapter':
+
+        // Chapter             Electronic, Physical
+        break;
+
+      case 'chapter_membership':
+        // Membership          Chapter
+        break;
+
+      case 'chapter_contact':
+        // Contact             Membership, Electronic, Physical, User Entity
+//        if (!_chapter_uuid_is_well_formed($node->chapter_primary_address_uuid)) {
+//          watchdog('chapter', "Contact's primary address UUID not valid'");
+//        }
+        break;
+
+      case 'chapter_board':
+        // Board               Contact, Board
+        break;
+    }
+  }
+  else {
+    watchdog('chapter', 'uuid module does not exists');
+  }
+}
+
+/**
+ * Implements hook_node_export_alter()
+ *
+ * Manipulate node array before export.
+ *
+ * The purpose of this is to allow a module to check nodes in the array for
+ * two or more nodes that must retain a relationship, and to add/remove other
+ * data to the array to assist with maintaining dependencies, relationships,
+ * references, and additional data required by the nodes.
+ *
+ * @param &$nodes
+ *   The array of nodes to alter.
+ * @param $format
+ *   The format of node code being used.
+ */
+function chapter_node_export_alter(&$nodes, $format) {
+
+  watchdog('chapter', 'Reordering nodes for proper export');
+
+  // Verify our node export weights variable is set before incuring
+  // overhead in our sort.  This should have been set at install time.
+
+  $tmp_value = variable_get('chapter_node_type_weights');
+
+  if (empty($tmp_value)) {
+    variable_set('chapter_node_type_weights', _chapter_node_export_weights());
+  }
+  // Sort based on export weight
+
+  uasort($nodes, "_chapter_node_export_weight_compare");
+}
+
